@@ -4794,38 +4794,29 @@ class CredentialInputSourceImporter(ResourceImporter):
         input_sources: list[dict[str, Any]],
         progress_callback: Callable[[int, int, int], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """Import multiple credential input sources by patching existing credentials.
-
-        This importer does not create new resources. Instead, it modifies the `inputs`
-        field of an existing credential to link it to another source credential.
+        """Create credential input source links between migrated credentials.
 
         Args:
             input_sources: List of credential input source data
             progress_callback: Optional callback for progress updates.
 
         Returns:
-            List of patched credential data
+            List of linked credential data
         """
         results = []
-        # Removed local success_count, failed_count, skipped_count
 
         for input_source in input_sources:
             source_id = input_source.pop("_source_id", input_source.get("id"))
-            # `credential` is the ID of the credential whose input is being sourced.
-            source_target_credential_id = input_source.get(
-                "credential"
-            )  # Renamed for clarity to avoid confusion with the source_credential for the input value.
+            source_target_credential_id = input_source.get("target_credential")
             source_input_field_name = input_source.get("input_field_name")
-            # `source_credential` is the ID of the credential that provides the source (e.g., a HashiCorp Vault credential).
             source_source_credential_id = input_source.get("source_credential")
-            source_source_credential_field_name = input_source.get("source_credential_field_name")
-
+            source_meta = input_source.get("metadata")
             if not all(
                 [
                     source_target_credential_id,
                     source_input_field_name,
                     source_source_credential_id,
-                    source_source_credential_field_name,
+                    source_meta,
                 ]
             ):
                 logger.warning(
@@ -4842,7 +4833,6 @@ class CredentialInputSourceImporter(ResourceImporter):
                     )
                 continue
 
-            # Check if the credential associated with this input source has already been migrated.
             target_credential_id = self.state.get_mapped_id(
                 "credentials", source_target_credential_id
             )
@@ -4862,7 +4852,6 @@ class CredentialInputSourceImporter(ResourceImporter):
                     )
                 continue
 
-            # Resolve the source_credential to its target ID
             target_source_credential_id = self.state.get_mapped_id(
                 "credentials", source_source_credential_id
             )
@@ -4882,37 +4871,24 @@ class CredentialInputSourceImporter(ResourceImporter):
                     )
                 continue
 
-            # Construct the value to patch into the target credential's 'inputs'
-            # Format: "$<target_source_credential_id>.<source_credential_field_name>$"
-            new_input_value = (
-                f"${target_source_credential_id}.{source_source_credential_field_name}$"
-            )
-
             try:
-                # Fetch the target credential to get its current inputs
-                # This is a GET, then PATCH - ensures other inputs are preserved
                 target_credential_obj = await self.client.get(
                     f"credentials/{target_credential_id}/"
                 )
-                current_inputs = target_credential_obj.get("inputs", {})
+                payload = {
+                    "target_credential": target_credential_id,
+                    "source_credential": target_source_credential_id,
+                    "input_field_name": source_input_field_name,
+                    "metadata": source_meta or {},
+                    "description": input_source.get("description", ""),
+                }
 
-                # Update the specific input field
-                current_inputs[source_input_field_name] = new_input_value
+                await self.client.post("credential_input_sources/", json_data=payload)
 
-                # Patch the target credential with the updated inputs
-                # Note: This is an important distinction: we modify an existing resource,
-                # not create a new one. The target_id for the state mapping will be
-                # the ID of the credential that was patched.
-                await self.client.patch(
-                    f"credentials/{target_credential_id}/",
-                    json_data={"inputs": current_inputs},
-                )
-
-                # Mark as completed (even though it's a PATCH, not CREATE)
                 self.state.mark_completed(
                     resource_type="credential_input_sources",
                     source_id=source_id,
-                    target_id=target_credential_id,  # Link to the patched credential
+                    target_id=target_credential_id,
                     source_name=input_source.get("name", f"CIS-{source_id}"),
                     target_name=target_credential_obj.get("name"),
                 )
@@ -4921,17 +4897,16 @@ class CredentialInputSourceImporter(ResourceImporter):
                     {"id": target_credential_id, "name": target_credential_obj.get("name")}
                 )
                 logger.info(
-                    "credential_input_source_patched",
+                    "credential_input_source_created",
                     source_id=source_id,
                     target_credential_id=target_credential_id,
                     input_field=source_input_field_name,
-                    new_input_value=new_input_value,
                 )
 
             except Exception as e:
                 self.stats["error_count"] += 1
                 logger.error(
-                    "credential_input_source_patch_failed",
+                    "credential_input_source_create_failed",
                     source_id=source_id,
                     target_credential_id=target_credential_id,
                     error=str(e),
@@ -5333,7 +5308,6 @@ class RoleDefinitionImporter(ResourceImporter):
                 )
                 return {"id": target_id, "name": name}
 
-            # Not on target yet — create it
             payload = {
                 "name": name,
                 "description": data.get("description", ""),
